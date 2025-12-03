@@ -156,11 +156,11 @@ def bitlinear_design(dev):
 
     # Tensor access patterns
     A_taps = TensorTiler2D.group_tiler(
-        (M, K_packed), (m, k_packed), (M_div_m_div_n_cores, K_div_k), prune_step=False
+        (M, K_packed), (m, k_packed), (M_div_m_div_n_cores, K_div_k)
     )
-    C_taps = TensorTiler2D.simple_tiler((1, M), (1, M_div_n_cores), prune_step=False)
+    C_taps = TensorTiler2D.simple_tiler((1, M), (1, M_div_n_cores))
     b_tap = TensorTiler2D.simple_tiler(
-        (1, K), pattern_repeat=M_div_m_div_n_cores, prune_step=False
+        (1, K), pattern_repeat=M_div_m_div_n_cores
     )[0]
 
     # Runtime sequence
