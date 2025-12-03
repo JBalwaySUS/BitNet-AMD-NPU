@@ -1,0 +1,22 @@
+# BitNet NPU Dependencies
+
+# Core
+fire
+torch>=2.2.0
+numpy>=1.24.0
+
+# Tokenizer
+sentencepiece
+tiktoken
+
+# Utilities
+blobfile
+einops
+transformers
+
+# NPU (bfloat16 support)
+ml-dtypes
+
+# Note: pyxrt (XRT Python bindings) must be installed from AMD
+# See: https://github.com/Xilinx/XRT
+# Install after XRT setup: pip install pyxrt
