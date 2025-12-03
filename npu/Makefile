@@ -85,22 +85,16 @@ design: ${BUILD_DIR}/${targetname}.mlir
 # XCLBIN compilation
 #===============================================================================
 
-# Peano flags (use LLVM-based compiler instead of chess)
-PEANO_INSTALL_DIR ?= $(shell dirname $(shell which aie2-opt 2>/dev/null || echo /opt/llvm-aie/bin/dummy))/../
-aiecc_flags = --no-compile-host --alloc-scheme=basic-sequential
-ifneq ($(wildcard ${PEANO_INSTALL_DIR}/bin/clang),)
-aiecc_flags += --no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR}
-endif
-
 .PHONY: compile
 
 ${BUILD_DIR}/${targetname}.xclbin: ${BUILD_DIR}/${targetname}.mlir ${BUILD_DIR}/${kernels}.o
-	cd ${BUILD_DIR} && ${AIECC} ${aiecc_flags} \
+	mkdir -p ${BUILD_DIR}
+	cd ${BUILD_DIR} && aiecc.py --no-compile-host \
 		--aie-generate-xclbin \
 		--xclbin-name=${targetname}.xclbin \
 		--aie-generate-npu-insts \
 		--npu-insts-name=${targetname}.insts.txt \
-		../${BUILD_DIR}/${targetname}.mlir
+		${targetname}.mlir
 
 compile: ${BUILD_DIR}/${targetname}.xclbin
 
