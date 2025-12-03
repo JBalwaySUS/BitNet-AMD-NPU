@@ -269,13 +269,13 @@ class BitLinear(nn.Module):
             # Trace buffer (required by kernel interface) - group_id 7
             self._bo_trace = xrt.bo(device, 1, xrt.bo.host_only, self._kernel.group_id(7))
             
-            # Copy instructions to device
-            self._bo_instr.write(self._instr.tobytes())
+            # Copy instructions to device (write requires buffer and offset)
+            self._bo_instr.write(self._instr.tobytes(), 0)
             self._bo_instr.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             
             # Copy weights to device (they don't change)
             weights_np = self.weight.cpu().numpy()
-            self._bo_weights.write(weights_np.tobytes())
+            self._bo_weights.write(weights_np.tobytes(), 0)
             self._bo_weights.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             
             print(f"Initialized NPU for BitLinear({self.in_features}, {self.out_features})")
@@ -328,9 +328,9 @@ class BitLinear(nn.Module):
         # Process each vector in the batch
         outputs = []
         for b in range(batch_size):
-            # Copy input to device
+            # Copy input to device (write requires buffer and offset)
             input_np = input_q[b].cpu().numpy()
-            self._bo_input.write(input_np.tobytes())
+            self._bo_input.write(input_np.tobytes(), 0)
             self._bo_input.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             
             # Run kernel (matches test.cpp signature)
@@ -350,7 +350,7 @@ class BitLinear(nn.Module):
             
             # Read output (int32)
             self._bo_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
-            output_bytes = self._bo_output.read(M * 4)
+            output_bytes = self._bo_output.read(M * 4, 0)  # read(size, offset)
             output_i32 = np.frombuffer(output_bytes, dtype=np.int32)
             
             outputs.append(output_i32)
