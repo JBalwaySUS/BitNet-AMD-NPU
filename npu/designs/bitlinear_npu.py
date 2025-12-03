@@ -18,7 +18,7 @@ from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D
 
 
-def bitlinear_design(dev):
+def bitlinear_design(dev, M=288, K=288, m=32, k=32):
     """
     Create IRON design for BitLinear int8 x int2 matrix-vector multiplication.
     
@@ -28,12 +28,18 @@ def bitlinear_design(dev):
     - output: int32 vector [M] (host applies scaling to get bfloat16)
     
     Note: Scaling is done on host to keep the NPU design simple.
+    
+    Args:
+        dev: Device type ("npu" or "npu2")
+        M: Output dimension (rows of weight matrix)
+        K: Input dimension (columns of weight matrix)
+        m: Tile size for M dimension
+        k: Tile size for K dimension
     """
-    # Dimensions
-    M = 288  # Output dimension (rows of weight matrix)
-    K = 288  # Input dimension (columns of weight matrix)
-    m = 32   # Tile size for M
-    k = 32   # Tile size for K
+    # Validate dimensions
+    assert M % m == 0, f"M ({M}) must be divisible by m ({m})"
+    assert K % k == 0, f"K ({K}) must be divisible by k ({k})"
+    assert K % 4 == 0, f"K ({K}) must be divisible by 4 (int2 packing)"
 
     n_cores = 1  # TODO: increase for parallelism
     M_div_n_cores = M // n_cores
@@ -152,7 +158,11 @@ if __name__ == "__main__":
         description="Generate MLIR for BitLinear int8 x int2 matvec on AMD NPU",
     )
     argparser.add_argument("--dev", type=str, choices=["npu", "npu2"], default="npu")
+    argparser.add_argument("-M", type=int, default=288, help="Output dimension")
+    argparser.add_argument("-K", type=int, default=288, help="Input dimension")
+    argparser.add_argument("-m", type=int, default=32, help="Tile size for M")
+    argparser.add_argument("-k", type=int, default=32, help="Tile size for K")
     args, _ = argparser.parse_known_args()
 
-    module = bitlinear_design(args.dev)
+    module = bitlinear_design(args.dev, M=args.M, K=args.K, m=args.m, k=args.k)
     print(module)

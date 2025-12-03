@@ -12,15 +12,17 @@
 ##===----------------------------------------------------------------------===##
 
 subdir = bitlinear
-targetname = bitlinear
 
-# Tile dimensions (must match design file)
+# Matrix dimensions (M=output, K=input)
 M ?= 288
 K ?= 288
+
+# Tile dimensions (must divide M and K evenly)
 m ?= 32
 k ?= 32
 
-# Kernel and design settings
+# Target names include dimensions
+targetname = bitlinear_${M}x${K}
 kernels = bitlinear_${m}x${k}
 use_iron ?= 1
 num_weight_groups ?= 4
@@ -77,7 +79,7 @@ kernel-all: ${BUILD_DIR}
 .PHONY: design design-all
 
 ${BUILD_DIR}/${targetname}.mlir: ${designs_dir}/bitlinear_npu.py | ${BUILD_DIR}
-	${PYTHON} $< --dev ${DEVICE} > $@
+	${PYTHON} $< --dev ${DEVICE} -M ${M} -K ${K} -m ${m} -k ${k} > $@
 
 design: ${BUILD_DIR}/${targetname}.mlir
 
