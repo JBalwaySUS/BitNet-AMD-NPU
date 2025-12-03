@@ -1,63 +1,67 @@
-# Makefile for BitNet AIE kernels
-#
-# This makefile compiles the int8 x int2 BitLinear kernel for AMD AIE
-#
-# Usage:
-#   make              - Build default kernel (32x32 tiles)
-#   make DIM_M=64     - Build with custom M dimension
-#   make clean        - Remove build artifacts
+##===- Makefile -----------------------------------------------------------===##
+# 
+# This file licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# 
+# Copyright (C) 2025
+# 
+##===----------------------------------------------------------------------===##
 
-# Default tile dimensions
-DIM_M ?= 32
-DIM_K ?= 32
-NUM_WEIGHT_GROUPS ?= 4
+# BitLinear kernel for int8 x int2 matrix-vector multiplication
+# Based on mlir-aie/programming_examples/basic/matrix_multiplication/matrix_vector
 
-# AIE compiler and tools
-# These should be set by the MLIR-AIE environment
-AIECC ?= aiecc.py
-AIE_CLANG ?= $(VITIS_AIETOOLS_DIR)/bin/aie2-clang
+# Default tile dimensions (must match design file)
+m ?= 32
+k ?= 32
 
-# Compiler flags
-AIE_FLAGS = -O2 -DDIM_M=$(DIM_M) -DDIM_K=$(DIM_K) -DNUM_WEIGHT_GROUPS=$(NUM_WEIGHT_GROUPS)
+# Number of weight groups for per-group scaling
+num_weight_groups ?= 4
 
-# Include paths for AIE API
-AIE_INCLUDES = -I$(VITIS_AIETOOLS_DIR)/include
+# Kernel output name
+kernels = bitlinear_${m}x${k}
 
-# Source files
-KERNEL_SRC = bitlinear_int8xint2.cc
+# Include common makefile settings
+SELF_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
+include ${SELF_DIR}../makefile-common
 
-# Output object file
-KERNEL_OBJ = bitlinear_$(DIM_M)x$(DIM_K).o
+# Kernel source directory
+kernels_dir = ${SELF_DIR}
+
+# Kernel defines
+KERNEL_DEFINES = -DDIM_M=${m} -DDIM_K=${k} -DNUM_WEIGHT_GROUPS=${num_weight_groups}
 
 # Default target
-all: $(KERNEL_OBJ)
+all: build/${kernels}.o
 
-# Compile kernel to object file
-$(KERNEL_OBJ): $(KERNEL_SRC)
-	$(AIE_CLANG) $(AIE_FLAGS) $(AIE_INCLUDES) -c $< -o $@
+# Build directory
+build:
+	mkdir -p build
 
-# Alternative: use xchesscc for compilation
-kernel_chess: $(KERNEL_SRC)
-	xchesscc -p me -P $(VITIS_AIETOOLS_DIR)/data/aie_ml/lib \
-		-c $(AIE_FLAGS) $(KERNEL_SRC) -o $(KERNEL_OBJ)
+# Compile kernel using xchesscc_wrapper
+build/${kernels}.o: ${kernels_dir}/bitlinear.cc | build
+	cd build && ${KERNEL_CC} ${KERNEL_CFLAGS} ${KERNEL_DEFINES} -c ../$< -o ${@F}
 
-# Build multiple tile sizes
-tile_sizes: 
-	$(MAKE) DIM_M=32 DIM_K=32
-	$(MAKE) DIM_M=32 DIM_K=64
-	$(MAKE) DIM_M=64 DIM_K=32
-	$(MAKE) DIM_M=64 DIM_K=64
+# Compile all common tile sizes
+tile_sizes: build
+	$(MAKE) m=32 k=32
+	$(MAKE) m=32 k=64
+	$(MAKE) m=64 k=32
+	$(MAKE) m=64 k=64
 
 # Clean build artifacts
 clean:
-	rm -f *.o *.elf *.map
+	rm -rf build
 
 # Print configuration
 info:
-	@echo "DIM_M = $(DIM_M)"
-	@echo "DIM_K = $(DIM_K)"
-	@echo "NUM_WEIGHT_GROUPS = $(NUM_WEIGHT_GROUPS)"
-	@echo "Output: $(KERNEL_OBJ)"
+	@echo "BitLinear Kernel Configuration"
+	@echo "=============================="
+	@echo "m (tile rows)      = ${m}"
+	@echo "k (tile cols)      = ${k}"
+	@echo "num_weight_groups  = ${num_weight_groups}"
+	@echo "Output             = build/${kernels}.o"
+	@echo "KERNEL_CC          = ${KERNEL_CC}"
+	@echo "KERNEL_CFLAGS      = ${KERNEL_CFLAGS}"
 
-.PHONY: all clean tile_sizes info kernel_chess
-
+.PHONY: all clean tile_sizes info

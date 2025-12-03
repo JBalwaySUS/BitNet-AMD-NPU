@@ -1,0 +1,52 @@
+# Common Makefile settings for BitNet NPU
+#
+# Based on mlir-aie/programming_examples/makefile-common
+#
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Copyright (C) 2025
+
+# VITIS/MLIR-AIE tools
+AIETOOLS_DIR ?= $(shell realpath $(dir $(shell which xchesscc))/../)
+AIE_INCLUDE_DIR ?= ${AIETOOLS_DIR}/data/versal_prod/lib
+AIE2_INCLUDE_DIR ?= ${AIETOOLS_DIR}/data/aie_ml/lib
+
+MLIR_AIE_DIR ?= $(shell python3 -c "from aie.utils.config import root_path; print(root_path())")
+
+# Compiler warnings
+WARNING_FLAGS = -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body -Wno-missing-template-arg-list-after-template-kw
+
+# Chess compiler flags
+CHESSCC2_FLAGS = -f -p me -P ${AIE2_INCLUDE_DIR} -I ${AIETOOLS_DIR}/include
+
+# Peano/LLVM wrapper flags for AIE2
+PEANOWRAP2_FLAGS = -O2 -std=c++20 --target=aie2-none-unknown-elf ${WARNING_FLAGS} -DNDEBUG -I ${MLIR_AIE_DIR}/include
+
+# Kernel compiler selection
+KERNEL_CC ?= xchesscc_wrapper
+KERNEL_CFLAGS ?= ${CHESSCCWRAP2_FLAGS}
+
+# Chess wrapper flags  
+CHESSCCWRAP2_FLAGS = aie2 -I ${AIETOOLS_DIR}/include
+
+# Python
+PYTHON ?= python3
+
+# AIECC compiler
+AIECC ?= aiecc.py
+
+# Build directory
+BUILD_DIR ?= build
+
+# Device type (npu or npu2)
+DEVICE ?= npu
+
+# PowerShell detection for WSL
+TEST_POWERSHELL := $(shell command -v powershell.exe >/dev/null 2>&1 && echo yes || echo no)
+ifeq ($(TEST_POWERSHELL),yes)
+	powershell = powershell.exe
+	getwslpath = wslpath -w
+else
+	powershell =
+	getwslpath = echo
+endif
+

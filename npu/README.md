@@ -16,13 +16,15 @@ npu/
 ├── model.py              # BitLinear NPU layers & Transformer
 ├── generate.py           # Text generation
 ├── kernels/
-│   ├── bitlinear_int8xint2.cc   # AIE C++ kernel
+│   ├── bitlinear.cc      # AIE C++ kernel
+│   ├── zero.cc           # Zero buffer kernel
 │   └── Makefile
 ├── designs/
-│   ├── bitlinear_npu.py         # IRON design
-│   └── transformer_block.py     # Layer configurations
-├── test_bitlinear.py     # Test suite
-└── Makefile              # Build system
+│   ├── bitlinear_npu.py  # IRON design
+│   └── transformer_block.py
+├── makefile-common       # Shared makefile settings
+├── Makefile              # Build system
+└── test_bitlinear.py     # Test suite
 ```
 
 ## Prerequisites
@@ -37,7 +39,7 @@ npu/
 ## Building NPU Kernels
 
 ```bash
-# Build AIE kernel
+# Build AIE kernel (requires xchesscc)
 make kernel
 
 # Generate MLIR design
@@ -49,9 +51,21 @@ make compile
 # Or build everything at once
 make all
 
-# Build all BitNet layer sizes
-make design-all
-make compile-all
+# Build all kernel tile sizes
+make kernel-all
+```
+
+### Configuration
+
+```bash
+# Custom tile sizes
+make kernel m=64 k=64
+
+# Custom dimensions for design
+make design M=2560 K=2560
+
+# Target NPU2 device
+make design DEVICE=npu2
 ```
 
 ## Usage
@@ -115,6 +129,22 @@ cache = make_cache(args, length=1024)
 logits = model(tokens, cache, start_pos=0)
 ```
 
+## Kernel Architecture
+
+The `bitlinear.cc` kernel implements int8 × int2 matrix-vector multiplication:
+
+```
+Input:   int8 activations [K]
+Weights: int2 packed [M, K/4]  (4 values per byte)
+Output:  bfloat16 [M]
+
+Functions:
+- zero_scalar_i32()           - Zero accumulator buffer
+- bitlinear_scalar_i8_i2_i32() - Scalar matvec accumulation
+- bitlinear_scale_i32_bf16()  - Apply scales to convert int32→bf16
+- bitlinear_full_*()          - Combined matvec + scale
+```
+
 ## BitNet Layer Dimensions
 
 | Layer | Output (M) | Input (K) | Packed Size |
@@ -147,10 +177,11 @@ Weights are packed as int2 (4 values per byte):
 
 - Falls back to CPU reference implementation if NPU/XCLBIN unavailable
 - Requires AMD Ryzen AI hardware for NPU acceleration
-- See `kernels/` for AIE kernel implementation details
+- Based on mlir-aie/programming_examples/basic/matrix_multiplication/matrix_vector
 
 ## References
 
 - [MLIR-AIE Programming Guide](../../mlir-aie/programming_guide/)
+- [Matrix Vector Example](../../mlir-aie/programming_examples/basic/matrix_multiplication/matrix_vector/)
 - [BitNet Paper](https://arxiv.org/abs/2310.11453)
 - [BitNet-b1.58-2B-4T](https://arxiv.org/abs/2504.12285)

@@ -1,109 +1,101 @@
+##===- Makefile -----------------------------------------------------------===##
+# 
+# This file licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# 
+# Copyright (C) 2025
+#
 # BitNet NPU Makefile
-#
-# Build and run BitNet inference on AMD NPU.
-#
-# Usage:
-#   make kernel       - Build AIE kernel
-#   make design       - Generate MLIR design
-#   make compile      - Compile MLIR to XCLBIN
-#   make test         - Run tests
-#   make all          - Build everything
-#   make clean        - Clean build artifacts
+# Based on mlir-aie/programming_examples/basic/matrix_multiplication/matrix_vector
+# 
+##===----------------------------------------------------------------------===##
 
-# Configuration
-DIM_M ?= 32
-DIM_K ?= 32
-TILE_M ?= 32
-TILE_K ?= 32
-N_CORES ?= 1
-DEVICE ?= npu
+subdir = bitlinear
+targetname = bitlinear
+
+# Tile dimensions (must match design file)
+M ?= 288
+K ?= 288
+m ?= 32
+k ?= 32
+
+# Kernel and design settings
+kernels = bitlinear_${m}x${k}
+use_iron ?= 1
+num_weight_groups ?= 4
+
+# Checkpoint directory for inference
 CKPT_DIR ?= checkpoints
 
-# Paths
-BUILD_DIR = build
-KERNEL_DIR = kernels
-DESIGN_DIR = designs
+# Include common makefile settings
+SELF_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
+include ${SELF_DIR}makefile-common
 
-# MLIR-AIE tools (set by environment)
-AIECC ?= aiecc.py
-PYTHON ?= python3
+# Kernel source and build directories
+kernels_dir = ${SELF_DIR}kernels
+designs_dir = ${SELF_DIR}designs
 
-# BitNet 3B layer dimensions
-WQKV_DIMS = -M 3840 -K 2560
-WO_DIMS = -M 2560 -K 2560
-W13_DIMS = -M 13824 -K 2560
-W2_DIMS = -M 2560 -K 6912
-
-# Default target
-all: kernel design
-
-# Create build directory
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
+# Kernel defines
+KERNEL_DEFINES = -DDIM_M=${m} -DDIM_K=${k} -DNUM_WEIGHT_GROUPS=${num_weight_groups}
 
 #===============================================================================
-# Kernel targets
+# Default target
+#===============================================================================
+
+.PHONY: all
+all: ${BUILD_DIR}/${kernels}.o ${BUILD_DIR}/${targetname}.mlir
+
+#===============================================================================
+# Build directory
+#===============================================================================
+
+${BUILD_DIR}:
+	mkdir -p ${BUILD_DIR}
+
+#===============================================================================
+# Kernel compilation
 #===============================================================================
 
 .PHONY: kernel kernel-all
 
-kernel: $(BUILD_DIR)
-	$(MAKE) -C $(KERNEL_DIR) DIM_M=$(DIM_M) DIM_K=$(DIM_K)
-	cp $(KERNEL_DIR)/bitlinear_$(DIM_M)x$(DIM_K).o $(BUILD_DIR)/
+${BUILD_DIR}/${kernels}.o: ${kernels_dir}/bitlinear.cc ${kernels_dir}/zero.cc | ${BUILD_DIR}
+	cd ${BUILD_DIR} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${KERNEL_DEFINES} -c ../$< -o ${@F}
 
-kernel-all: $(BUILD_DIR)
-	$(MAKE) -C $(KERNEL_DIR) tile_sizes
-	cp $(KERNEL_DIR)/*.o $(BUILD_DIR)/
+kernel: ${BUILD_DIR}/${kernels}.o
+
+kernel-all: ${BUILD_DIR}
+	$(MAKE) m=32 k=32 kernel
+	$(MAKE) m=32 k=64 kernel
+	$(MAKE) m=64 k=32 kernel
+	$(MAKE) m=64 k=64 kernel
 
 #===============================================================================
-# Design targets
+# Design generation
 #===============================================================================
 
 .PHONY: design design-all
 
-design: $(BUILD_DIR)
-	$(PYTHON) $(DESIGN_DIR)/bitlinear_npu.py \
-		-d $(DEVICE) \
-		-M $(DIM_M) -K $(DIM_K) \
-		-m $(TILE_M) -k $(TILE_K) \
-		-c $(N_CORES) \
-		-o $(BUILD_DIR)/bitlinear_$(DIM_M)x$(DIM_K).mlir
+${BUILD_DIR}/${targetname}.mlir: ${designs_dir}/bitlinear_npu.py | ${BUILD_DIR}
+	${PYTHON} $< --dev ${DEVICE} > $@
 
-design-all: $(BUILD_DIR)
-	$(PYTHON) $(DESIGN_DIR)/bitlinear_npu.py -d $(DEVICE) $(WQKV_DIMS) \
-		-o $(BUILD_DIR)/bitlinear_wqkv.mlir
-	$(PYTHON) $(DESIGN_DIR)/bitlinear_npu.py -d $(DEVICE) $(WO_DIMS) \
-		-o $(BUILD_DIR)/bitlinear_wo.mlir
-	$(PYTHON) $(DESIGN_DIR)/bitlinear_npu.py -d $(DEVICE) $(W13_DIMS) \
-		-o $(BUILD_DIR)/bitlinear_w13.mlir
-	$(PYTHON) $(DESIGN_DIR)/bitlinear_npu.py -d $(DEVICE) $(W2_DIMS) \
-		-o $(BUILD_DIR)/bitlinear_w2.mlir
+design: ${BUILD_DIR}/${targetname}.mlir
 
 #===============================================================================
-# Compile targets
+# XCLBIN compilation
 #===============================================================================
 
-.PHONY: compile compile-all
+.PHONY: compile
 
-compile: design kernel
-	cd $(BUILD_DIR) && $(AIECC) \
+${BUILD_DIR}/${targetname}.xclbin: ${BUILD_DIR}/${targetname}.mlir ${BUILD_DIR}/${kernels}.o
+	cd ${BUILD_DIR} && ${AIECC} \
 		--aie-generate-xclbin \
 		--aie-generate-npu-insts \
-		--xclbin-name=bitlinear_$(DIM_M)x$(DIM_K).xclbin \
-		--insts-name=bitlinear_$(DIM_M)x$(DIM_K).insts.bin \
-		bitlinear_$(DIM_M)x$(DIM_K).mlir
+		--xclbin-name=${targetname}.xclbin \
+		--insts-name=${targetname}.insts.bin \
+		${targetname}.mlir
 
-compile-all: design-all kernel-all
-	@for mlir in $(BUILD_DIR)/*.mlir; do \
-		base=$$(basename $$mlir .mlir); \
-		echo "Compiling $$base..."; \
-		cd $(BUILD_DIR) && $(AIECC) \
-			--aie-generate-xclbin \
-			--aie-generate-npu-insts \
-			--xclbin-name=$$base.xclbin \
-			--insts-name=$$base.insts.bin \
-			$$mlir; \
-	done
+compile: ${BUILD_DIR}/${targetname}.xclbin
 
 #===============================================================================
 # Test targets
@@ -114,28 +106,28 @@ compile-all: design-all kernel-all
 test: test-cpu
 
 test-cpu:
-	$(PYTHON) test_bitlinear.py --cpu-only -v
+	${PYTHON} test_bitlinear.py --cpu-only -v
 
 test-npu: compile
-	$(PYTHON) test_bitlinear.py \
-		--xclbin $(BUILD_DIR)/bitlinear_$(DIM_M)x$(DIM_K).xclbin \
-		--instr $(BUILD_DIR)/bitlinear_$(DIM_M)x$(DIM_K).insts.bin \
-		-M $(DIM_M) -K $(DIM_K) -v
+	${PYTHON} test_bitlinear.py \
+		--xclbin ${BUILD_DIR}/${targetname}.xclbin \
+		--instr ${BUILD_DIR}/${targetname}.insts.bin \
+		-M ${M} -K ${K} -v
 
 #===============================================================================
 # Run targets
 #===============================================================================
 
-.PHONY: run run-interactive
+.PHONY: run run-interactive run-sample
 
 run:
-	$(PYTHON) generate.py $(CKPT_DIR) --xclbin_dir $(BUILD_DIR)
+	${PYTHON} generate.py ${CKPT_DIR} --xclbin_dir ${BUILD_DIR}
 
 run-interactive:
-	$(PYTHON) generate.py $(CKPT_DIR) --interactive --xclbin_dir $(BUILD_DIR)
+	${PYTHON} generate.py ${CKPT_DIR} --interactive --xclbin_dir ${BUILD_DIR}
 
 run-sample:
-	$(PYTHON) generate.py $(CKPT_DIR) --sampling --xclbin_dir $(BUILD_DIR)
+	${PYTHON} generate.py ${CKPT_DIR} --sampling --xclbin_dir ${BUILD_DIR}
 
 #===============================================================================
 # Info targets
@@ -146,17 +138,24 @@ run-sample:
 info:
 	@echo "BitNet NPU Configuration"
 	@echo "========================"
-	@echo "DIM_M      = $(DIM_M)"
-	@echo "DIM_K      = $(DIM_K)"
-	@echo "TILE_M     = $(TILE_M)"
-	@echo "TILE_K     = $(TILE_K)"
-	@echo "N_CORES    = $(N_CORES)"
-	@echo "DEVICE     = $(DEVICE)"
-	@echo "BUILD_DIR  = $(BUILD_DIR)"
-	@echo "CKPT_DIR   = $(CKPT_DIR)"
+	@echo "M (output dim)     = ${M}"
+	@echo "K (input dim)      = ${K}"
+	@echo "m (tile rows)      = ${m}"
+	@echo "k (tile cols)      = ${k}"
+	@echo "num_weight_groups  = ${num_weight_groups}"
+	@echo "DEVICE             = ${DEVICE}"
+	@echo "BUILD_DIR          = ${BUILD_DIR}"
+	@echo "KERNEL_CC          = ${KERNEL_CC}"
+	@echo "Kernel object      = ${BUILD_DIR}/${kernels}.o"
+	@echo "Design MLIR        = ${BUILD_DIR}/${targetname}.mlir"
 
 layer-info:
-	$(PYTHON) $(DESIGN_DIR)/transformer_block.py --info
+	@echo "BitNet 3B Layer Dimensions"
+	@echo "=========================="
+	@echo "wqkv: M=3840, K=2560"
+	@echo "wo:   M=2560, K=2560"
+	@echo "w13:  M=13824, K=2560"
+	@echo "w2:   M=2560, K=6912"
 
 #===============================================================================
 # Clean targets
@@ -165,8 +164,7 @@ layer-info:
 .PHONY: clean clean-all
 
 clean:
-	rm -rf $(BUILD_DIR)
-	$(MAKE) -C $(KERNEL_DIR) clean
+	rm -rf ${BUILD_DIR}
 
 clean-all: clean
 	find . -name "*.pyc" -delete
@@ -183,29 +181,30 @@ help:
 	@echo "==================="
 	@echo ""
 	@echo "Build targets:"
-	@echo "  kernel         - Build AIE kernel"
-	@echo "  kernel-all     - Build all kernel sizes"
-	@echo "  design         - Generate MLIR design"
-	@echo "  design-all     - Generate all layer designs"
-	@echo "  compile        - Compile MLIR to XCLBIN"
-	@echo "  compile-all    - Compile all designs"
+	@echo "  all              - Build kernel and design"
+	@echo "  kernel           - Build AIE kernel"
+	@echo "  kernel-all       - Build all kernel sizes"
+	@echo "  design           - Generate MLIR design"
+	@echo "  compile          - Compile MLIR to XCLBIN"
 	@echo ""
 	@echo "Test targets:"
-	@echo "  test           - Run CPU reference tests"
-	@echo "  test-npu       - Run NPU hardware tests"
+	@echo "  test             - Run CPU reference tests"
+	@echo "  test-npu         - Run NPU hardware tests"
 	@echo ""
 	@echo "Run targets:"
-	@echo "  run            - Generate text"
-	@echo "  run-interactive - Interactive generation"
-	@echo "  run-sample     - Generation with sampling"
+	@echo "  run              - Generate text"
+	@echo "  run-interactive  - Interactive generation"
+	@echo "  run-sample       - Generation with sampling"
 	@echo ""
 	@echo "Other:"
-	@echo "  info           - Print configuration"
-	@echo "  layer-info     - Print layer dimensions"
-	@echo "  clean          - Clean build artifacts"
-	@echo "  help           - Show this help"
+	@echo "  info             - Print configuration"
+	@echo "  layer-info       - Print layer dimensions"
+	@echo "  clean            - Clean build artifacts"
+	@echo "  help             - Show this help"
 	@echo ""
 	@echo "Variables:"
 	@echo "  CKPT_DIR=<path>  - Model checkpoint directory"
-	@echo "  DIM_M=<n>        - Output dimension"
-	@echo "  DIM_K=<n>        - Input dimension"
+	@echo "  M=<n>            - Output dimension"
+	@echo "  K=<n>            - Input dimension"
+	@echo "  m=<n>            - Tile rows"
+	@echo "  k=<n>            - Tile columns"
