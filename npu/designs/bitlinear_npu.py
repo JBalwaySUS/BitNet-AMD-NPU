@@ -17,21 +17,17 @@ from aie.iron.device import NPU1, NPU2
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D
 
-# bfloat16 support
-try:
-    from ml_dtypes import bfloat16
-except ImportError:
-    bfloat16 = np.float16
-
 
 def bitlinear_design(dev):
     """
     Create IRON design for BitLinear int8 x int2 matrix-vector multiplication.
     
-    Operation: output = (input @ weights.T) * scales
+    Operation: output = input @ weights.T (int32 accumulator)
     - input: int8 vector [K] (quantized activations)  
     - weights: int2 packed matrix [M, K/4] (4 int2 per byte)
-    - output: bfloat16 vector [M]
+    - output: int32 vector [M] (host applies scaling to get bfloat16)
+    
+    Note: Scaling is done on host to keep the NPU design simple.
     """
     # Dimensions
     M = 288  # Output dimension (rows of weight matrix)
@@ -48,126 +44,75 @@ def bitlinear_design(dev):
     k_packed = k // 4
     K_packed = K // 4
 
-    # Number of weight groups for scaling
-    num_weight_groups = 4
-
     # Whether to use vectorized kernel
     vectorized = False
 
-    # Define types
+    # Define types - following matrix_vector_iron.py pattern
     dtype_in = np.dtype[np.int8]
     dtype_in_str = "i8"
     dtype_weight = np.dtype[np.int8]  # Packed int2
     dtype_weight_str = "i2"
-    dtype_acc = np.dtype[np.int32]
-    dtype_acc_str = "i32"
-    dtype_out = np.dtype[bfloat16]
-    dtype_out_str = "bf16"
+    dtype_out = np.dtype[np.int32]    # Output is int32 (scaling done on host)
+    dtype_out_str = "i32"
 
     # Full tensor types
     A_ty = np.ndarray[(M, K_packed), dtype_weight]  # Packed weights [M, K/4]
     B_ty = np.ndarray[(1, K), dtype_in]              # Input activations [1, K]
-    C_ty = np.ndarray[(1, M), dtype_out]             # Output [1, M]
-    S_ty = np.ndarray[(1,), dtype_out]               # Activation scale
-    WS_ty = np.ndarray[(num_weight_groups,), dtype_out]  # Weight scales
+    C_ty = np.ndarray[(1, M), dtype_out]             # Output [1, M] - int32
 
     # Tile types
     inA_ty = np.ndarray[(m, k_packed), dtype_weight]  # Weight tile [m, k/4]
     inB_ty = np.ndarray[(k,), dtype_in]               # Input tile [k]
-    outC_ty = np.ndarray[(m,), dtype_out]             # Output tile [m]
-    accC_ty = np.ndarray[(m,), dtype_acc]             # Accumulator tile [m]
+    outC_ty = np.ndarray[(m,), dtype_out]             # Output tile [m] - int32
 
-    # AIE kernel declarations
+    # AIE kernel declarations - match matrix_vector pattern
     func_type = "vectorized" if vectorized else "scalar"
     
-    # Zero kernel for int32 accumulator
+    # Zero kernel for int32 output
     zero = Kernel(
-        f"zero_{func_type}_{dtype_acc_str}",
+        f"zero_{func_type}_{dtype_out_str}",
         f"bitlinear_{m}x{k}.o",
-        [accC_ty],
+        [outC_ty],
     )
     
-    # Accumulation kernel: int8 input x int2 weights -> int32 accumulator
-    bitlinear_acc = Kernel(
-        f"bitlinear_{func_type}_{dtype_in_str}_{dtype_weight_str}_{dtype_acc_str}",
+    # BitLinear matvec kernel: int8 input x int2 weights -> int32 output
+    bitlinear = Kernel(
+        f"bitlinear_{func_type}_{dtype_in_str}_{dtype_weight_str}_{dtype_out_str}",
         f"bitlinear_{m}x{k}.o",
-        [inB_ty, inA_ty, accC_ty],
-    )
-    
-    # Scale kernel: int32 accumulator -> bfloat16 output
-    bitlinear_scale = Kernel(
-        f"bitlinear_scale_{dtype_acc_str}_{dtype_out_str}",
-        f"bitlinear_{m}x{k}.o",
-        [accC_ty, outC_ty, S_ty, WS_ty],
+        [inB_ty, inA_ty, outC_ty],
     )
 
-    # Worker function: zero, accumulate across K tiles, then scale
-    def core_fn(of_a, of_b, of_c, of_acc, of_s, of_ws, zero, bitlinear_acc, bitlinear_scale):
-        # Get scales (constant across all tiles)
-        elem_s = of_s.acquire(1)
-        elem_ws = of_ws.acquire(1)
+    # Define the work each core will do - exactly like matrix_vector_iron.py
+    def core_fn(of_a, of_b, of_c, zero, bitlinear):
+        elem_out = of_c.acquire(1)
+        zero(elem_out)
+        for _ in range_(K_div_k):
+            elem_in_a = of_a.acquire(1)
+            elem_in_b = of_b.acquire(1)
+            bitlinear(elem_in_b, elem_in_a, elem_out)
+            of_a.release(1)
+            of_b.release(1)
+        of_c.release(1)
 
-        for _ in range_(M_div_m_div_n_cores):
-            # Acquire accumulator and output buffers
-            elem_acc = of_acc.acquire(1)
-            elem_out = of_c.acquire(1)
-            
-            # Zero the accumulator
-            zero(elem_acc)
-
-            # Accumulate across K dimension
-            for _ in range_(K_div_k):
-                elem_in_a = of_a.acquire(1)  # Weight tile
-                elem_in_b = of_b.acquire(1)  # Input tile
-                bitlinear_acc(elem_in_b, elem_in_a, elem_acc)
-                of_a.release(1)
-                of_b.release(1)
-
-            # Apply scaling: int32 -> bfloat16
-            bitlinear_scale(elem_acc, elem_out, elem_s, elem_ws)
-            
-            of_acc.release(1)
-            of_c.release(1)
-
-        of_s.release(1)
-        of_ws.release(1)
-
-    # Create object fifos and workers
+    # Create object fifos and workers for each core
     memA_fifos = []
     coreA_fifos = []
     outC_fifos = []
-    accC_fifos = []  # Local accumulator FIFOs
     workers = []
+    B_fifo = ObjectFifo(inB_ty)
     
-    B_fifo = ObjectFifo(inB_ty, name="inB")
-    S_fifo = ObjectFifo(S_ty, name="scale")
-    WS_fifo = ObjectFifo(WS_ty, name="weight_scales")
-
     for i in range(n_cores):
         a_fifo = ObjectFifo(inA_ty, name=f"memA{i}")
         memA_fifos.append(a_fifo)
         coreA_fifos.append(a_fifo.cons().forward())
         outC_fifos.append(ObjectFifo(outC_ty, name=f"outC{i}"))
-        # Local accumulator FIFO (depth=1, used only within the core)
-        accC_fifos.append(ObjectFifo(accC_ty, name=f"accC{i}", depth=1))
-        
         w = Worker(
             core_fn,
-            [
-                coreA_fifos[i].cons(),
-                B_fifo.cons(),
-                outC_fifos[i].prod(),
-                accC_fifos[i].prod(),  # Use as local buffer
-                S_fifo.cons(),
-                WS_fifo.cons(),
-                zero,
-                bitlinear_acc,
-                bitlinear_scale,
-            ],
+            [coreA_fifos[i].cons(), B_fifo.cons(), outC_fifos[i].prod(), zero, bitlinear],
         )
         workers.append(w)
 
-    # Tensor access patterns
+    # Define the tiling access patterns for input and output tensors
     A_taps = TensorTiler2D.group_tiler(
         (M, K_packed), (m, k_packed), (M_div_m_div_n_cores, K_div_k)
     )
@@ -176,30 +121,26 @@ def bitlinear_design(dev):
         (1, K), pattern_repeat=M_div_m_div_n_cores
     )[0]
 
-    # Runtime sequence
+    # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty, S_ty, WS_ty) as (a_in, b_in, c_out, s_in, ws_in):
+    with rt.sequence(A_ty, B_ty, C_ty) as (a_in, b_in, c_out):
         rt.start(*workers)
 
-        # Fill scales
-        rt.fill(S_fifo.prod(), s_in)
-        rt.fill(WS_fifo.prod(), ws_in)
-
-        # Fill input (broadcast to all cores)
+        # there is only one b tile
         rt.fill(B_fifo.prod(), b_in, b_tap)
 
-        # Fill weights and drain outputs per core
         for i, (a_tap, c_tap) in enumerate(zip(A_taps, C_taps)):
             rt.fill(memA_fifos[i].prod(), a_in, a_tap)
             rt.drain(outC_fifos[i].cons(), c_out, c_tap, wait=True)
 
-    # Create program
+    # Create the program from the device type and runtime
     if dev == "npu":
         dev_ty = NPU1()
     else:
         dev_ty = NPU2()
-    
     my_program = Program(dev_ty, rt)
+
+    # Place components and generate MLIR module
     module = my_program.resolve_program(SequentialPlacer())
 
     return module
