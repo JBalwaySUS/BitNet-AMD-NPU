@@ -196,7 +196,7 @@ class NPUGenerator:
         stats.phase("decode")
 
         # Decode loop
-        eos_id = self.tokenizer.eot_id
+        eos_id = self.tokenizer.eos_id
         kv_seqlen = torch.tensor(prompt_lens, dtype=torch.int)
         
         for niter in range(1, gen_length):
@@ -228,7 +228,7 @@ class NPUGenerator:
         def trim_answer(prompt_len, tokens):
             """Trim answer at EOS token."""
             tokens = tokens[:gen_length]
-            eos_id = self.tokenizer.eot_id
+            eos_id = self.tokenizer.eos_id
             if eos_id in tokens:
                 return tokens[:tokens.index(eos_id) + 1]
             return tokens

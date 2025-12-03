@@ -102,63 +102,6 @@ class NPURuntime:
 
 
 #==============================================================================
-# CPU Reference Implementation for BitLinear
-#==============================================================================
-
-def bitnet_int8xint2_linear_cpu(input_int8, weights_packed, act_scale, weight_scales):
-    """
-    CPU reference implementation of int8 x int2 BitLinear.
-    
-    Args:
-        input_int8: Quantized int8 activations [K] or [batch, K]
-        weights_packed: Packed int2 weights [M, K/4]
-        act_scale: Activation scale (scalar tensor)
-        weight_scales: Per-group weight scales [num_groups]
-    
-    Returns:
-        bfloat16 output tensor
-    """
-    M, K_packed = weights_packed.shape
-    K = K_packed * 4
-    num_groups = len(weight_scales)
-    rows_per_group = M // num_groups
-    
-    # Unpack int2 weights to int8
-    weights_u8 = weights_packed.cpu().numpy().astype(np.uint8)
-    weights_unpacked = np.zeros((M, K), dtype=np.int8)
-    weights_unpacked[:, 0::4] = ((weights_u8 & 0x03) - 1).astype(np.int8)
-    weights_unpacked[:, 1::4] = (((weights_u8 >> 2) & 0x03) - 1).astype(np.int8)
-    weights_unpacked[:, 2::4] = (((weights_u8 >> 4) & 0x03) - 1).astype(np.int8)
-    weights_unpacked[:, 3::4] = (((weights_u8 >> 6) & 0x03) - 1).astype(np.int8)
-    
-    # Compute matrix-vector multiplication
-    input_np = input_int8.cpu().numpy().astype(np.int32)
-    weights_np = weights_unpacked.astype(np.int32)
-    
-    if input_np.ndim == 1:
-        output = np.dot(weights_np, input_np)
-    else:
-        output = np.dot(input_np, weights_np.T)
-    
-    # Apply scaling
-    inv_act_scale = 1.0 / act_scale.item()
-    weight_scales_np = weight_scales.cpu().numpy().astype(np.float32)
-    
-    output_f = output.astype(np.float32) * inv_act_scale
-    
-    # Apply per-group weight scales
-    for g in range(num_groups):
-        start = g * rows_per_group
-        end = (g + 1) * rows_per_group if g < num_groups - 1 else M
-        if output_f.ndim == 1:
-            output_f[start:end] *= weight_scales_np[g]
-        else:
-            output_f[..., start:end] *= weight_scales_np[g]
-    
-    return torch.from_numpy(output_f).to(dtype=torch.bfloat16, device=input_int8.device)
-
-
-#==============================================================================
 # Model Arguments
 #==============================================================================
 
@@ -245,22 +188,50 @@ class BitLinear(nn.Module):
         # NPU resources (initialized lazily)
         self._npu_runtime = None
         self._kernel = None
-        self._buffers_initialized = False
-        self._use_cpu_fallback = not HAS_XRT
+        self._instr = None
+        self._bo_instr = None
+        self._bo_input = None
+        self._bo_weights = None
+        self._bo_output = None
         
         # Paths to compiled kernels
         self.xclbin_path = str(Path(xclbin_dir) / f"bitlinear_{out_features}x{in_features}.xclbin")
         self.instr_path = str(Path(xclbin_dir) / f"bitlinear_{out_features}x{in_features}.insts.bin")
     
+    def _load_instructions(self):
+        """Load instruction binary for NPU."""
+        instr_path = Path(self.instr_path)
+        if not instr_path.exists():
+            raise FileNotFoundError(
+                f"Instruction binary not found at {self.instr_path}. "
+                f"Build the NPU kernels with: make compile M={self.out_features} K={self.in_features}"
+            )
+        
+        with open(instr_path, 'rb') as f:
+            instr_data = f.read()
+        
+        # Convert to uint32 array
+        self._instr = np.frombuffer(instr_data, dtype=np.uint32)
+        return self._instr
+    
     def _init_npu(self):
         """Initialize NPU resources lazily on first forward pass."""
-        if self._kernel is not None or self._use_cpu_fallback:
+        if self._kernel is not None:
             return
         
+        # Check XRT availability
+        if not HAS_XRT:
+            raise RuntimeError(
+                "XRT (Xilinx Runtime) not available. "
+                "Install pyxrt to use NPU acceleration."
+            )
+        
+        # Check XCLBIN exists
         if not Path(self.xclbin_path).exists():
-            print(f"Info: XCLBIN not found at {self.xclbin_path}, using CPU")
-            self._use_cpu_fallback = True
-            return
+            raise FileNotFoundError(
+                f"XCLBIN not found at {self.xclbin_path}. "
+                f"Build the NPU kernels with: make compile M={self.out_features} K={self.in_features}"
+            )
         
         try:
             self._npu_runtime = NPURuntime()
@@ -270,10 +241,42 @@ class BitLinear(nn.Module):
             self._npu_runtime.load_xclbin(self.xclbin_path, layer_name)
             self._kernel = self._npu_runtime.get_kernel(layer_name)
             
+            # Load instructions
+            self._load_instructions()
+            
+            # Create buffer objects
+            device = self._npu_runtime.device
+            M = self.out_features
+            K = self.in_features
+            K_packed = K // 4
+            
+            # Instruction buffer
+            instr_size = self._instr.size * self._instr.itemsize
+            self._bo_instr = xrt.bo(device, instr_size, xrt.bo.cacheable, self._kernel.group_id(1))
+            
+            # Input buffer (int8, size K)
+            self._bo_input = xrt.bo(device, K, xrt.bo.host_only, self._kernel.group_id(3))
+            
+            # Weights buffer (packed int2, size M * K/4)
+            self._bo_weights = xrt.bo(device, M * K_packed, xrt.bo.host_only, self._kernel.group_id(4))
+            
+            # Output buffer (int32, size M * 4 bytes)
+            self._bo_output = xrt.bo(device, M * 4, xrt.bo.host_only, self._kernel.group_id(5))
+            
+            # Copy instructions to device
+            self._bo_instr.write(self._instr.tobytes())
+            self._bo_instr.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            
+            # Copy weights to device (they don't change)
+            weights_np = self.weight.cpu().numpy()
+            self._bo_weights.write(weights_np.tobytes())
+            self._bo_weights.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            
             print(f"Initialized NPU for BitLinear({self.in_features}, {self.out_features})")
         except Exception as e:
-            print(f"Info: NPU init failed ({e}), using CPU")
-            self._use_cpu_fallback = True
+            raise RuntimeError(
+                f"NPU initialization failed for BitLinear({self.in_features}, {self.out_features}): {e}"
+            ) from e
     
     @torch.compile
     def quant_input(self, input):
@@ -295,14 +298,90 @@ class BitLinear(nn.Module):
         input_q, act_scale = self.quant_input(input)
         
         # Initialize NPU on first call
-        if self._kernel is None and not self._use_cpu_fallback:
+        if self._kernel is None:
             self._init_npu()
         
-        # TODO: Add NPU kernel execution when XCLBIN is compiled
-        # For now, use CPU reference implementation
-        return bitnet_int8xint2_linear_cpu(
-            input_q, self.weight, act_scale.squeeze(), self.weight_scale
-        )
+        # Execute NPU kernel
+        return self._execute_npu(input_q, act_scale)
+    
+    def _execute_npu(self, input_q, act_scale):
+        """Execute the BitLinear operation on NPU."""
+        M = self.out_features
+        K = self.in_features
+        
+        # Handle batch dimension - NPU processes one vector at a time
+        original_shape = input_q.shape
+        if input_q.dim() > 1:
+            # Flatten batch dimensions
+            input_q = input_q.reshape(-1, K)
+            batch_size = input_q.shape[0]
+        else:
+            input_q = input_q.unsqueeze(0)
+            batch_size = 1
+        
+        # Process each vector in the batch
+        outputs = []
+        for b in range(batch_size):
+            # Copy input to device
+            input_np = input_q[b].cpu().numpy()
+            self._bo_input.write(input_np.tobytes())
+            self._bo_input.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            
+            # Run kernel
+            opcode = 3  # Standard run opcode
+            run = self._kernel(
+                opcode,
+                self._bo_instr,
+                len(self._instr),
+                self._bo_weights,
+                self._bo_input,
+                self._bo_output,
+            )
+            run.wait()
+            
+            # Read output (int32)
+            self._bo_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+            output_bytes = self._bo_output.read(M * 4)
+            output_i32 = np.frombuffer(output_bytes, dtype=np.int32)
+            
+            outputs.append(output_i32)
+        
+        # Stack outputs
+        output_np = np.stack(outputs, axis=0)  # [batch, M]
+        
+        # Apply scaling: output = (acc / act_scale) * weight_scale
+        # act_scale is per-tensor, weight_scale is per-group
+        inv_act_scale = 1.0 / act_scale.squeeze().float().cpu().numpy()
+        weight_scales_np = self.weight_scale.float().cpu().numpy()
+        
+        # Convert to float for scaling
+        output_f = output_np.astype(np.float32)
+        
+        # Apply activation scale (broadcast over batch and M)
+        if inv_act_scale.ndim == 0:
+            output_f = output_f * float(inv_act_scale)
+        else:
+            output_f = output_f * inv_act_scale[:, np.newaxis]
+        
+        # Apply per-group weight scales
+        num_groups = len(weight_scales_np)
+        rows_per_group = M // num_groups
+        for g in range(num_groups):
+            start = g * rows_per_group
+            end = (g + 1) * rows_per_group if g < num_groups - 1 else M
+            output_f[:, start:end] *= weight_scales_np[g]
+        
+        # Convert to tensor and reshape to original batch shape
+        output_tensor = torch.from_numpy(output_f).to(dtype=torch.bfloat16, device=input_q.device)
+        
+        # Restore original shape
+        if len(original_shape) > 1:
+            output_shape = list(original_shape[:-1]) + [M]
+            output_tensor = output_tensor.reshape(output_shape)
+        else:
+            output_tensor = output_tensor.squeeze(0)
+        
+        return output_tensor
 
 
 class BitLinearPrefill(nn.Linear):
