@@ -18,8 +18,9 @@ M ?= 288
 K ?= 288
 
 # Tile dimensions (must divide M and K evenly)
-m ?= 32
-k ?= 32
+# Use 64 for larger matrices to stay under DMA limit of 64 iterations
+m ?= 64
+k ?= 64
 
 # Target names include dimensions
 targetname = bitlinear_${M}x${K}
