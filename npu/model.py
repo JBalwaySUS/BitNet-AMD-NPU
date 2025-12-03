@@ -196,7 +196,7 @@ class BitLinear(nn.Module):
         
         # Paths to compiled kernels
         self.xclbin_path = str(Path(xclbin_dir) / f"bitlinear_{out_features}x{in_features}.xclbin")
-        self.instr_path = str(Path(xclbin_dir) / f"bitlinear_{out_features}x{in_features}.insts.bin")
+        self.instr_path = str(Path(xclbin_dir) / f"bitlinear_{out_features}x{in_features}.insts.txt")
     
     def _load_instructions(self):
         """Load instruction binary for NPU."""
@@ -244,24 +244,30 @@ class BitLinear(nn.Module):
             # Load instructions
             self._load_instructions()
             
-            # Create buffer objects
+            # Create buffer objects following test.cpp pattern
             device = self._npu_runtime.device
             M = self.out_features
             K = self.in_features
             K_packed = K // 4
             
-            # Instruction buffer
+            # Instruction buffer (group_id 1, cacheable)
             instr_size = self._instr.size * self._instr.itemsize
             self._bo_instr = xrt.bo(device, instr_size, xrt.bo.cacheable, self._kernel.group_id(1))
             
-            # Input buffer (int8, size K)
-            self._bo_input = xrt.bo(device, K, xrt.bo.host_only, self._kernel.group_id(3))
+            # Weights buffer A (packed int2, size M * K/4) - group_id 3
+            self._bo_weights = xrt.bo(device, M * K_packed, xrt.bo.host_only, self._kernel.group_id(3))
             
-            # Weights buffer (packed int2, size M * K/4)
-            self._bo_weights = xrt.bo(device, M * K_packed, xrt.bo.host_only, self._kernel.group_id(4))
+            # Input buffer B (int8, size K) - group_id 4
+            self._bo_input = xrt.bo(device, K, xrt.bo.host_only, self._kernel.group_id(4))
             
-            # Output buffer (int32, size M * 4 bytes)
+            # Output buffer C (int32, size M * 4 bytes) - group_id 5
             self._bo_output = xrt.bo(device, M * 4, xrt.bo.host_only, self._kernel.group_id(5))
+            
+            # Temporary buffer (required by kernel interface) - group_id 6
+            self._bo_tmp = xrt.bo(device, 1, xrt.bo.host_only, self._kernel.group_id(6))
+            
+            # Trace buffer (required by kernel interface) - group_id 7
+            self._bo_trace = xrt.bo(device, 1, xrt.bo.host_only, self._kernel.group_id(7))
             
             # Copy instructions to device
             self._bo_instr.write(self._instr.tobytes())
@@ -327,15 +333,18 @@ class BitLinear(nn.Module):
             self._bo_input.write(input_np.tobytes())
             self._bo_input.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             
-            # Run kernel
+            # Run kernel (matches test.cpp signature)
+            # kernel(opcode, bo_instr, instr_size, bo_a, bo_b, bo_out, bo_tmp, bo_trace)
             opcode = 3  # Standard run opcode
             run = self._kernel(
                 opcode,
                 self._bo_instr,
                 len(self._instr),
-                self._bo_weights,
-                self._bo_input,
-                self._bo_output,
+                self._bo_weights,   # A - weights
+                self._bo_input,     # B - input
+                self._bo_output,    # C - output
+                self._bo_tmp,       # tmp buffer
+                self._bo_trace,     # trace buffer
             )
             run.wait()
             
