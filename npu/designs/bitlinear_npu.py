@@ -39,18 +39,6 @@ def bitlinear_design(dev, M=288, K=288, m=32, k=32):
     # Hardware DMA limit: each dimension size must be <= 64
     DMA_LIMIT = 64
     
-    # Auto-adjust tile sizes if needed to stay under DMA limit
-    # Find smallest valid tile size that keeps iterations <= 64
-    while K // k > DMA_LIMIT:
-        k *= 2
-        if k > K:
-            raise ValueError(f"Cannot find valid tile size for K={K} (DMA limit={DMA_LIMIT})")
-    
-    while M // m > DMA_LIMIT * 4:  # Allow up to 4 cores
-        m *= 2
-        if m > M:
-            raise ValueError(f"Cannot find valid tile size for M={M} (DMA limit={DMA_LIMIT})")
-    
     # Validate dimensions
     assert M % m == 0, f"M ({M}) must be divisible by m ({m})"
     assert K % k == 0, f"K ({K}) must be divisible by k ({k})"
@@ -59,19 +47,33 @@ def bitlinear_design(dev, M=288, K=288, m=32, k=32):
     M_div_m = M // m
     K_div_k = K // k
     
+    # Check DMA limits and provide helpful error messages
+    if K_div_k > DMA_LIMIT:
+        # Find minimum k that works
+        min_k = k
+        while K // min_k > DMA_LIMIT:
+            min_k *= 2
+        raise ValueError(
+            f"K/k = {K_div_k} exceeds DMA limit of {DMA_LIMIT}. "
+            f"Use k={min_k} instead: make compile M={M} K={K} m={m} k={min_k}"
+        )
+    
     # Calculate minimum cores needed to keep M iterations under limit
     n_cores = 1
     while M_div_m // n_cores > DMA_LIMIT:
         n_cores += 1
         if n_cores > 4:
-            raise ValueError(f"M={M} with m={m} requires more than 4 cores")
+            # Find minimum m that works with 4 cores
+            min_m = m
+            while M // min_m > DMA_LIMIT * 4:
+                min_m *= 2
+            raise ValueError(
+                f"M={M} with m={m} requires more than 4 cores. "
+                f"Use m={min_m} instead: make compile M={M} K={K} m={min_m} k={k}"
+            )
     
     M_div_n_cores = M // n_cores
     M_div_m_div_n_cores = M // (m * n_cores)
-    
-    # Verify we're under the limit
-    assert M_div_m_div_n_cores <= DMA_LIMIT, f"M iterations {M_div_m_div_n_cores} exceeds DMA limit"
-    assert K_div_k <= DMA_LIMIT, f"K iterations {K_div_k} exceeds DMA limit"
     
     print(f"BitLinear design: M={M}, K={K}, m={m}, k={k}, n_cores={n_cores}, M_iters={M_div_m_div_n_cores}, K_iters={K_div_k}", file=__import__('sys').stderr)
 

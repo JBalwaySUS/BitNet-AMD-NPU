@@ -24,9 +24,14 @@ k ?= 64
 
 # Target names include dimensions
 targetname = bitlinear_${M}x${K}
-kernels = bitlinear_${m}x${k}
 use_iron ?= 1
 num_weight_groups ?= 4
+
+# Kernel dimensions - will be set based on layer dimensions
+# These match what the design will use after DMA limit adjustments
+# For K=6912: need k=128 (6912/128=54 < 64)
+# For M=13824: need m=64 and 4 cores (13824/64/4=54 < 64)
+kernels = bitlinear_${m}x${k}
 
 # Checkpoint directory for inference
 CKPT_DIR ?= checkpoints
@@ -154,12 +159,20 @@ info:
 	@echo "Design MLIR        = ${BUILD_DIR}/${targetname}.mlir"
 
 layer-info:
-	@echo "BitNet 3B Layer Dimensions"
-	@echo "=========================="
-	@echo "wqkv: M=3840, K=2560"
-	@echo "wo:   M=2560, K=2560"
-	@echo "w13:  M=13824, K=2560"
-	@echo "w2:   M=2560, K=6912"
+	@echo "BitNet 3B Layer Dimensions and Build Commands"
+	@echo "=============================================="
+	@echo "wqkv: M=3840, K=2560  -> make compile M=3840 K=2560 m=64 k=64"
+	@echo "wo:   M=2560, K=2560  -> make compile M=2560 K=2560 m=64 k=64"
+	@echo "w13:  M=13824, K=2560 -> make compile M=13824 K=2560 m=64 k=64"
+	@echo "w2:   M=2560, K=6912  -> make compile M=2560 K=6912 m=64 k=128"
+
+# Build all BitNet layers
+.PHONY: compile-all-layers
+compile-all-layers:
+	$(MAKE) compile M=3840 K=2560 m=64 k=64
+	$(MAKE) compile M=2560 K=2560 m=64 k=64
+	$(MAKE) compile M=13824 K=2560 m=64 k=64
+	$(MAKE) compile M=2560 K=6912 m=64 k=128
 
 #===============================================================================
 # Clean targets
