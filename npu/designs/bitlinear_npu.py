@@ -80,44 +80,53 @@ def bitlinear_design(dev):
     # AIE kernel declarations
     func_type = "vectorized" if vectorized else "scalar"
     
+    # Zero kernel for int32 accumulator
     zero = Kernel(
         f"zero_{func_type}_{dtype_acc_str}",
         f"bitlinear_{m}x{k}.o",
         [accC_ty],
     )
     
-    bitlinear = Kernel(
+    # Accumulation kernel: int8 input x int2 weights -> int32 accumulator
+    bitlinear_acc = Kernel(
         f"bitlinear_{func_type}_{dtype_in_str}_{dtype_weight_str}_{dtype_acc_str}",
         f"bitlinear_{m}x{k}.o",
         [inB_ty, inA_ty, accC_ty],
     )
     
-    scale = Kernel(
+    # Scale kernel: int32 accumulator -> bfloat16 output
+    bitlinear_scale = Kernel(
         f"bitlinear_scale_{dtype_acc_str}_{dtype_out_str}",
         f"bitlinear_{m}x{k}.o",
         [accC_ty, outC_ty, S_ty, WS_ty],
     )
 
-    # Worker function: accumulate then scale
-    def core_fn(of_a, of_b, of_c, of_s, of_ws, zero, bitlinear, scale):
+    # Worker function: zero, accumulate across K tiles, then scale
+    def core_fn(of_a, of_b, of_c, of_acc, of_s, of_ws, zero, bitlinear_acc, bitlinear_scale):
         # Get scales (constant across all tiles)
         elem_s = of_s.acquire(1)
         elem_ws = of_ws.acquire(1)
 
         for _ in range_(M_div_m_div_n_cores):
-            # Acquire output buffer and zero it
+            # Acquire accumulator and output buffers
+            elem_acc = of_acc.acquire(1)
             elem_out = of_c.acquire(1)
+            
+            # Zero the accumulator
+            zero(elem_acc)
 
             # Accumulate across K dimension
             for _ in range_(K_div_k):
                 elem_in_a = of_a.acquire(1)  # Weight tile
                 elem_in_b = of_b.acquire(1)  # Input tile
-                bitlinear(elem_in_b, elem_in_a, elem_out)
+                bitlinear_acc(elem_in_b, elem_in_a, elem_acc)
                 of_a.release(1)
                 of_b.release(1)
 
-            # Apply scaling
-            scale(elem_out, elem_out, elem_s, elem_ws)
+            # Apply scaling: int32 -> bfloat16
+            bitlinear_scale(elem_acc, elem_out, elem_s, elem_ws)
+            
+            of_acc.release(1)
             of_c.release(1)
 
         of_s.release(1)
@@ -127,6 +136,7 @@ def bitlinear_design(dev):
     memA_fifos = []
     coreA_fifos = []
     outC_fifos = []
+    accC_fifos = []  # Local accumulator FIFOs
     workers = []
     
     B_fifo = ObjectFifo(inB_ty, name="inB")
@@ -138,6 +148,8 @@ def bitlinear_design(dev):
         memA_fifos.append(a_fifo)
         coreA_fifos.append(a_fifo.cons().forward())
         outC_fifos.append(ObjectFifo(outC_ty, name=f"outC{i}"))
+        # Local accumulator FIFO (depth=1, used only within the core)
+        accC_fifos.append(ObjectFifo(accC_ty, name=f"accC{i}", depth=1))
         
         w = Worker(
             core_fn,
@@ -145,11 +157,12 @@ def bitlinear_design(dev):
                 coreA_fifos[i].cons(),
                 B_fifo.cons(),
                 outC_fifos[i].prod(),
+                accC_fifos[i].prod(),  # Use as local buffer
                 S_fifo.cons(),
                 WS_fifo.cons(),
                 zero,
-                bitlinear,
-                scale,
+                bitlinear_acc,
+                bitlinear_scale,
             ],
         )
         workers.append(w)
